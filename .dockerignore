@@ -1,0 +1,9 @@
+venv/
+.env
+*.pem
+.git
+.github/
+__pycache__/
+*.pyc
+.DS_Store
+docker-compose*.yml

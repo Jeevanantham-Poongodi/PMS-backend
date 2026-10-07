@@ -1,0 +1,14 @@
+# Local development: builds the image from this directory
+services:
+  api:
+    build: .
+    container_name: pms-backend
+    env_file: .env
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
