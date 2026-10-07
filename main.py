@@ -50,5 +50,11 @@ def test_connection():
             "error": str(e)
         }
 
-
+@app.get("/hello")
+def read_root():
+    # Simple GET method returns Hello World and checks if Supabase is initialized
+    return {
+        "message": "Hello, World!",
+        "supabase_connected": supabase is not None
+    }
    
