@@ -65,7 +65,7 @@ jobs:
           envs: GHCR_USER,GHCR_TOKEN
           script: |
             set -e
-            cd ~/pms-backend
+            cd ~/PMS-backend
             mv docker-compose.prod.yml docker-compose.yml
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             docker compose pull
