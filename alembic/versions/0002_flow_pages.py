@@ -1,0 +1,459 @@
+"""Flow pages (feature 002): masters, stock ledger, flow cases.
+
+Tables come from app.models (autogenerate). RLS, grants, policies, append-only triggers, the
+balance trigger, permissions and settings are written by hand below (data-model.md).
+
+Revision ID: 0002
+Revises: 0001
+Create Date: 2026-10-22 22:57:17.462144
+"""
+
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
+
+from alembic import op
+
+revision: str = "0002"
+down_revision: str | None = "0001"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
+
+TABLES = [
+    "locations",
+    "vendors",
+    "batches",
+    "hospital_settings",
+    "flow_cases",
+    "flow_case_lines",
+    "flow_events",
+    "stock_documents",
+    "ledger_lines",
+    "stock_balances",
+    "ndps_register",
+]
+INSERTABLE = [t for t in TABLES if t != "stock_balances"]
+UPDATABLE = ["batches", "flow_cases", "flow_case_lines", "hospital_settings"]
+APPEND_ONLY = ["stock_documents", "ledger_lines", "flow_events", "ndps_register"]
+MEMBER = "hospital_id in (select app.current_hospital_ids())"
+WRITER = f"{MEMBER} and app.has_permission(hospital_id, 'flows.write')"
+
+
+def _security_sql() -> str:
+    parts = []
+    for t in TABLES:
+        parts.append(f"alter table public.{t} enable row level security;")
+        parts.append(f"revoke all on public.{t} from anon, authenticated;")
+        parts.append(f"grant select on public.{t} to authenticated;")
+        parts.append(
+            f"create policy {t}_member_read on public.{t} for select to authenticated"
+            f" using ({MEMBER});"
+        )
+    for t in INSERTABLE:
+        parts.append(f"grant insert on public.{t} to authenticated;")
+        parts.append(
+            f"create policy {t}_insert on public.{t} for insert to authenticated"
+            f" with check ({WRITER});"
+        )
+    for t in UPDATABLE:
+        parts.append(f"grant update on public.{t} to authenticated;")
+        parts.append(
+            f"create policy {t}_update on public.{t} for update to authenticated"
+            f" using ({WRITER}) with check ({WRITER});"
+        )
+    for t in APPEND_ONLY:
+        parts.append(
+            f"create trigger {t}_append_only before update or delete on public.{t}"
+            " for each row execute function app.forbid_update_delete();"
+        )
+    return "\n".join(parts) + BALANCE_AND_SEED_SQL
+
+
+# Balances follow the ledger. SECURITY DEFINER so authenticated users cannot write balances
+# directly; the check constraint on stock_balances aborts any posting that would go negative.
+BALANCE_AND_SEED_SQL = """
+create function app.apply_ledger_line()
+returns trigger
+language plpgsql security definer
+set search_path = public
+as $$
+begin
+  insert into public.stock_balances (hospital_id, batch_id, location_id, item_id, qty)
+  values (new.hospital_id, new.batch_id, new.location_id, new.item_id, new.qty)
+  on conflict (hospital_id, batch_id, location_id)
+  do update set qty = public.stock_balances.qty + excluded.qty;
+  return new;
+end
+$$;
+revoke all on function app.apply_ledger_line() from public;
+
+create trigger ledger_lines_apply after insert on public.ledger_lines
+  for each row execute function app.apply_ledger_line();
+
+insert into public.permissions (code, description) values
+  ('flows.read',    'View flow cases'),
+  ('flows.write',   'Raise and move flow cases, post stock'),
+  ('flows.approve', 'Take approval outcomes in the flows'),
+  ('stock.read',    'View stock balances'),
+  ('masters.read',  'View locations, vendors and batches');
+
+insert into public.role_permissions (hospital_id, role_code, permission_code)
+select r.hospital_id, r.code, p.code
+from public.roles r
+cross join (values ('flows.read'), ('flows.write'), ('flows.approve'), ('stock.read'),
+                   ('masters.read')) as p(code)
+where r.code = 'admin'
+on conflict do nothing;
+
+insert into public.hospital_settings (hospital_id, key, value)
+select h.id, s.key, s.value::jsonb
+from public.hospitals h
+cross join (values ('expiry.alert_windows_days', '[90, 60, 30]'),
+                   ('allocation.block_on_expiry_date', 'true')) as s(key, value)
+on conflict do nothing;
+"""
+
+SECURITY_SQL = _security_sql()
+
+DOWNGRADE_SQL = """
+drop trigger if exists ledger_lines_apply on public.ledger_lines;
+drop function if exists app.apply_ledger_line();
+delete from public.role_permissions where permission_code in
+  ('flows.read', 'flows.write', 'flows.approve', 'stock.read', 'masters.read');
+delete from public.permissions where code in
+  ('flows.read', 'flows.write', 'flows.approve', 'stock.read', 'masters.read');
+"""
+
+
+def _raw(sql: str) -> None:
+    # Straight to the driver, as in 0001: the SQL has $$ bodies that bind parsing would misread.
+    op.get_bind().connection.cursor().execute(sql)
+
+
+def upgrade() -> None:
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.create_table(
+        "flow_cases",
+        sa.Column("id", sa.BigInteger(), sa.Identity(always=True), nullable=False),
+        sa.Column("hospital_id", sa.BigInteger(), nullable=False),
+        sa.Column("flow", sa.SmallInteger(), nullable=False),
+        sa.Column("node", sa.Text(), nullable=False),
+        sa.Column("title", sa.Text(), nullable=False),
+        sa.Column(
+            "data",
+            postgresql.JSONB(astext_type=sa.Text()),
+            server_default=sa.text("'{}'::jsonb"),
+            nullable=False,
+        ),
+        sa.Column("parent_case_id", sa.BigInteger(), nullable=True),
+        sa.Column("closed", sa.Boolean(), server_default=sa.text("false"), nullable=False),
+        sa.Column("raised_by", sa.UUID(), server_default=sa.text("auth.uid()"), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.CheckConstraint("flow between 1 and 5", name="flow_cases_flow_check"),
+        sa.ForeignKeyConstraint(
+            ["hospital_id"],
+            ["hospitals.id"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["parent_case_id"],
+            ["flow_cases.id"],
+        ),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index(
+        "flow_cases_hospital_flow_idx",
+        "flow_cases",
+        ["hospital_id", "flow", "closed"],
+        unique=False,
+    )
+    op.create_table(
+        "hospital_settings",
+        sa.Column("hospital_id", sa.BigInteger(), nullable=False),
+        sa.Column("key", sa.Text(), nullable=False),
+        sa.Column("value", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        sa.ForeignKeyConstraint(
+            ["hospital_id"],
+            ["hospitals.id"],
+        ),
+        sa.PrimaryKeyConstraint("hospital_id", "key"),
+    )
+    op.create_table(
+        "locations",
+        sa.Column("id", sa.BigInteger(), sa.Identity(always=True), nullable=False),
+        sa.Column("hospital_id", sa.BigInteger(), nullable=False),
+        sa.Column("code", sa.Text(), nullable=False),
+        sa.Column("name", sa.Text(), nullable=False),
+        sa.Column("kind", sa.Text(), nullable=False),
+        sa.Column("allocatable", sa.Boolean(), server_default=sa.text("true"), nullable=False),
+        sa.CheckConstraint(
+            "kind in ('central_store', 'pharmacy', 'ward', 'ot', 'icu', 'quarantine_qc',"
+            " 'quarantine_expiry', 'quarantine_recall')",
+            name="locations_kind_check",
+        ),
+        sa.CheckConstraint(
+            "not (kind like 'quarantine_%%' and allocatable)", name="locations_quarantine_check"
+        ),
+        sa.ForeignKeyConstraint(
+            ["hospital_id"],
+            ["hospitals.id"],
+        ),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("hospital_id", "code", name="locations_hospital_code_key"),
+    )
+    op.create_table(
+        "vendors",
+        sa.Column("id", sa.BigInteger(), sa.Identity(always=True), nullable=False),
+        sa.Column("hospital_id", sa.BigInteger(), nullable=False),
+        sa.Column("name", sa.Text(), nullable=False),
+        sa.Column("active", sa.Boolean(), server_default=sa.text("true"), nullable=False),
+        sa.ForeignKeyConstraint(
+            ["hospital_id"],
+            ["hospitals.id"],
+        ),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("hospital_id", "name", name="vendors_hospital_name_key"),
+    )
+    op.create_table(
+        "batches",
+        sa.Column("id", sa.BigInteger(), sa.Identity(always=True), nullable=False),
+        sa.Column("hospital_id", sa.BigInteger(), nullable=False),
+        sa.Column("item_id", sa.BigInteger(), nullable=False),
+        sa.Column("batch_no", sa.Text(), nullable=False),
+        sa.Column("expiry_date", sa.Date(), nullable=False),
+        sa.Column("vendor_id", sa.BigInteger(), nullable=True),
+        sa.Column("blocked", sa.Boolean(), server_default=sa.text("false"), nullable=False),
+        sa.Column("first_receipt_at", sa.DateTime(timezone=True), nullable=True),
+        sa.ForeignKeyConstraint(
+            ["hospital_id"],
+            ["hospitals.id"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["item_id"],
+            ["items.id"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["vendor_id"],
+            ["vendors.id"],
+        ),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("hospital_id", "item_id", "batch_no", name="batches_item_batch_key"),
+    )
+    op.create_table(
+        "flow_events",
+        sa.Column("id", sa.BigInteger(), sa.Identity(always=True), nullable=False),
+        sa.Column("hospital_id", sa.BigInteger(), nullable=False),
+        sa.Column("case_id", sa.BigInteger(), nullable=False),
+        sa.Column("from_node", sa.Text(), nullable=True),
+        sa.Column("outcome", sa.Text(), nullable=True),
+        sa.Column("to_node", sa.Text(), nullable=False),
+        sa.Column("actor", sa.UUID(), server_default=sa.text("auth.uid()"), nullable=False),
+        sa.Column("note", sa.Text(), nullable=True),
+        sa.Column("input", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.ForeignKeyConstraint(
+            ["case_id"],
+            ["flow_cases.id"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["hospital_id"],
+            ["hospitals.id"],
+        ),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_table(
+        "stock_documents",
+        sa.Column("id", sa.BigInteger(), sa.Identity(always=True), nullable=False),
+        sa.Column("hospital_id", sa.BigInteger(), nullable=False),
+        sa.Column("doc_type", sa.Text(), nullable=False),
+        sa.Column("case_id", sa.BigInteger(), nullable=True),
+        sa.Column("patient_ref", sa.Text(), nullable=True),
+        sa.Column("prescriber", sa.Text(), nullable=True),
+        sa.Column("note", sa.Text(), nullable=True),
+        sa.Column("posted_by", sa.UUID(), server_default=sa.text("auth.uid()"), nullable=False),
+        sa.Column(
+            "posted_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False
+        ),
+        sa.CheckConstraint(
+            "doc_type in ('opening', 'receipt', 'transfer', 'issue', 'dispense', 'return',"
+            " 'return_to_vendor', 'write_off')",
+            name="stock_documents_type_check",
+        ),
+        sa.ForeignKeyConstraint(
+            ["case_id"],
+            ["flow_cases.id"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["hospital_id"],
+            ["hospitals.id"],
+        ),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_table(
+        "flow_case_lines",
+        sa.Column("id", sa.BigInteger(), sa.Identity(always=True), nullable=False),
+        sa.Column("hospital_id", sa.BigInteger(), nullable=False),
+        sa.Column("case_id", sa.BigInteger(), nullable=False),
+        sa.Column("item_id", sa.BigInteger(), nullable=False),
+        sa.Column("batch_id", sa.BigInteger(), nullable=True),
+        sa.Column("location_id", sa.BigInteger(), nullable=True),
+        sa.Column("qty_requested", sa.Numeric(precision=12, scale=2), nullable=False),
+        sa.Column("qty_approved", sa.Numeric(precision=12, scale=2), nullable=True),
+        sa.ForeignKeyConstraint(
+            ["batch_id"],
+            ["batches.id"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["case_id"],
+            ["flow_cases.id"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["hospital_id"],
+            ["hospitals.id"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["item_id"],
+            ["items.id"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["location_id"],
+            ["locations.id"],
+        ),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_table(
+        "ledger_lines",
+        sa.Column("id", sa.BigInteger(), sa.Identity(always=True), nullable=False),
+        sa.Column("hospital_id", sa.BigInteger(), nullable=False),
+        sa.Column("document_id", sa.BigInteger(), nullable=False),
+        sa.Column("item_id", sa.BigInteger(), nullable=False),
+        sa.Column("batch_id", sa.BigInteger(), nullable=False),
+        sa.Column("location_id", sa.BigInteger(), nullable=False),
+        sa.Column("qty", sa.Numeric(precision=12, scale=2), nullable=False),
+        sa.Column(
+            "posted_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False
+        ),
+        sa.CheckConstraint("qty <> 0", name="ledger_lines_qty_check"),
+        sa.ForeignKeyConstraint(
+            ["batch_id"],
+            ["batches.id"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["document_id"],
+            ["stock_documents.id"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["hospital_id"],
+            ["hospitals.id"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["item_id"],
+            ["items.id"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["location_id"],
+            ["locations.id"],
+        ),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index(
+        "ledger_lines_batch_idx", "ledger_lines", ["hospital_id", "batch_id"], unique=False
+    )
+    op.create_table(
+        "ndps_register",
+        sa.Column("id", sa.BigInteger(), sa.Identity(always=True), nullable=False),
+        sa.Column("hospital_id", sa.BigInteger(), nullable=False),
+        sa.Column("case_id", sa.BigInteger(), nullable=False),
+        sa.Column("item_id", sa.BigInteger(), nullable=False),
+        sa.Column("batch_id", sa.BigInteger(), nullable=True),
+        sa.Column("qty", sa.Numeric(precision=12, scale=2), nullable=False),
+        sa.Column("patient_ref", sa.Text(), nullable=False),
+        sa.Column("signoff_1", sa.UUID(), nullable=False),
+        sa.Column("signoff_2", sa.UUID(), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.ForeignKeyConstraint(
+            ["batch_id"],
+            ["batches.id"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["case_id"],
+            ["flow_cases.id"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["hospital_id"],
+            ["hospitals.id"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["item_id"],
+            ["items.id"],
+        ),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_table(
+        "stock_balances",
+        sa.Column("hospital_id", sa.BigInteger(), nullable=False),
+        sa.Column("batch_id", sa.BigInteger(), nullable=False),
+        sa.Column("location_id", sa.BigInteger(), nullable=False),
+        sa.Column("item_id", sa.BigInteger(), nullable=False),
+        sa.Column("qty", sa.Numeric(precision=12, scale=2), nullable=False),
+        sa.CheckConstraint("qty >= 0", name="stock_balances_qty_check"),
+        sa.ForeignKeyConstraint(
+            ["batch_id"],
+            ["batches.id"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["hospital_id"],
+            ["hospitals.id"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["item_id"],
+            ["items.id"],
+        ),
+        sa.ForeignKeyConstraint(
+            ["location_id"],
+            ["locations.id"],
+        ),
+        sa.PrimaryKeyConstraint("hospital_id", "batch_id", "location_id"),
+    )
+    # ### end Alembic commands ###
+    _raw(SECURITY_SQL)
+
+
+def downgrade() -> None:
+    _raw(DOWNGRADE_SQL)
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.drop_table("stock_balances")
+    op.drop_table("ndps_register")
+    op.drop_index("ledger_lines_batch_idx", table_name="ledger_lines")
+    op.drop_table("ledger_lines")
+    op.drop_table("flow_case_lines")
+    op.drop_table("stock_documents")
+    op.drop_table("flow_events")
+    op.drop_table("batches")
+    op.drop_table("vendors")
+    op.drop_table("locations")
+    op.drop_table("hospital_settings")
+    op.drop_index("flow_cases_hospital_flow_idx", table_name="flow_cases")
+    op.drop_table("flow_cases")
+    # ### end Alembic commands ###
