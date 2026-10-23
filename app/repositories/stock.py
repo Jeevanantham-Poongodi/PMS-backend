@@ -1,14 +1,21 @@
-"""SQL for stock documents, the append-only ledger and balances (research R3, R4).
-
-Balances are written only by the database trigger app.apply_ledger_line(); this module never
-updates them. Runs inside a user transaction, so RLS also filters every query.
-"""
+"""SQL for stock documents, the ledger and balances. Runs inside a user transaction (RLS)."""
 
 from datetime import date
 from decimal import Decimal
 from typing import Any
 
 from psycopg import Cursor
+
+BALANCE_COLUMNS = (
+    "s.location_id, l.name as location_name, l.kind as location_kind, s.item_id,"
+    " i.name as item_name, s.batch_id, b.batch_no, b.expiry_date, b.blocked, s.qty"
+)
+BALANCE_FROM = (
+    " from public.stock_balances s"
+    " join public.locations l on l.id = s.location_id"
+    " join public.items i on i.id = s.item_id"
+    " join public.batches b on b.id = s.batch_id"
+)
 
 
 def insert_document(
@@ -30,22 +37,22 @@ def insert_document(
 
 
 def insert_lines(cur: Cursor, hospital_id: int, document_id: int, lines: list[dict]) -> None:
+    # executemany pipelines the inserts: one round trip instead of one per line.
     cur.executemany(
         "insert into public.ledger_lines"
         " (hospital_id, document_id, item_id, batch_id, location_id, qty)"
         " values (%s, %s, %s, %s, %s, %s)",
         [
-            (hospital_id, document_id, ln["item_id"], ln["batch_id"], ln["location_id"], ln["qty"])
-            for ln in lines
+            (
+                hospital_id,
+                document_id,
+                line["item_id"],
+                line["batch_id"],
+                line["location_id"],
+                line["qty"],
+            )
+            for line in lines
         ],
-    )
-
-
-def set_first_receipt(cur: Cursor, hospital_id: int, batch_ids: list[int]) -> None:
-    cur.execute(
-        "update public.batches set first_receipt_at = now()"
-        " where hospital_id = %s and id = any(%s) and first_receipt_at is null",
-        (hospital_id, batch_ids),
     )
 
 
@@ -57,22 +64,19 @@ def fefo_candidates(
     today: date,
     block_on_expiry_date: bool,
 ) -> list[dict]:
-    """Allocatable stock of an item at a location in D-005 order: expiry, first receipt, id.
-
-    Excludes non-allocatable (quarantine) locations, blocked batches, and batches on or after
-    their expiry date (D-012 temporary rule; with the setting off, the expiry date itself is
-    still allowed).
-    """
+    """Allocatable stock of an item at a location in FEFO order (D-005): expiry date, then first
+    receipt, then batch ID. Excludes blocked batches, non-allocatable locations (constitution III)
+    and batches on or after expiry (D-012 temporary rule, from configuration)."""
+    expiry_test = "b.expiry_date > %s" if block_on_expiry_date else "b.expiry_date >= %s"
     cur.execute(
-        "select b.id as batch_id, sb.qty, b.expiry_date, b.first_receipt_at"
-        " from public.stock_balances sb"
-        " join public.batches b on b.id = sb.batch_id"
-        " join public.locations l on l.id = sb.location_id"
-        " where sb.hospital_id = %s and sb.item_id = %s and sb.location_id = %s and sb.qty > 0"
-        "   and l.allocatable and not b.blocked"
-        "   and (b.expiry_date > %s or (not %s and b.expiry_date = %s))"
+        "select s.batch_id, b.batch_no, b.expiry_date, s.qty"
+        " from public.stock_balances s"
+        " join public.batches b on b.id = s.batch_id"
+        " join public.locations l on l.id = s.location_id"
+        " where s.hospital_id = %s and s.item_id = %s and s.location_id = %s and s.qty > 0"
+        f" and l.allocatable and not b.blocked and {expiry_test}"
         " order by b.expiry_date, b.first_receipt_at nulls last, b.id",
-        (hospital_id, item_id, location_id, today, block_on_expiry_date, today),
+        (hospital_id, item_id, location_id, today),
     )
     return cur.fetchall()
 
@@ -84,104 +88,66 @@ def balance(cur: Cursor, hospital_id: int, batch_id: int, location_id: int) -> D
         (hospital_id, batch_id, location_id),
     )
     row = cur.fetchone()
-    return row["qty"] if row else Decimal(0)
+    return Decimal(0) if row is None else row["qty"]
 
 
-BALANCE_COLUMNS = (
-    "sb.location_id, l.name as location_name, l.kind as location_kind, sb.item_id,"
-    " i.name as item_name, sb.batch_id, b.batch_no, b.expiry_date, b.blocked, sb.qty"
-)
-BALANCE_FROM = (
-    " from public.stock_balances sb"
-    " join public.locations l on l.id = sb.location_id"
-    " join public.items i on i.id = sb.item_id"
-    " join public.batches b on b.id = sb.batch_id"
-)
-
-
-def balances(
+def list_balances(
     cur: Cursor, hospital_id: int, location_id: int | None, item_id: int | None
 ) -> list[dict]:
-    sql = f"select {BALANCE_COLUMNS}{BALANCE_FROM} where sb.hospital_id = %s and sb.qty <> 0"
+    sql = f"select {BALANCE_COLUMNS}{BALANCE_FROM} where s.hospital_id = %s and s.qty > 0"
     params: list[Any] = [hospital_id]
     if location_id is not None:
-        sql += " and sb.location_id = %s"
+        sql += " and s.location_id = %s"
         params.append(location_id)
     if item_id is not None:
-        sql += " and sb.item_id = %s"
+        sql += " and s.item_id = %s"
         params.append(item_id)
-    cur.execute(sql + " order by l.id, i.name, b.expiry_date, b.id", params)
+    cur.execute(sql + " order by l.id, i.name, b.expiry_date", params)
     return cur.fetchall()
 
 
 def batch_holdings(cur: Cursor, hospital_id: int, batch_id: int) -> list[dict]:
     cur.execute(
         f"select {BALANCE_COLUMNS}{BALANCE_FROM}"
-        " where sb.hospital_id = %s and sb.batch_id = %s and sb.qty > 0 order by l.id",
+        " where s.hospital_id = %s and s.batch_id = %s and s.qty > 0 order by l.id",
         (hospital_id, batch_id),
     )
     return cur.fetchall()
 
 
-def batch_dispensed(cur: Cursor, hospital_id: int, batch_id: int) -> list[dict]:
-    """Dispense movements of a batch with the patient reference and prescriber (FR-025)."""
+def batch_dispensings(cur: Cursor, hospital_id: int, batch_id: int) -> list[dict]:
+    """Dispense movements of a batch with the patient they went to (F5 trace)."""
     cur.execute(
-        "select d.patient_ref, d.prescriber, -ll.qty as qty, d.posted_at"
+        "select d.patient_ref, d.prescriber, -sum(ll.qty) as qty, d.posted_at"
         " from public.ledger_lines ll join public.stock_documents d on d.id = ll.document_id"
         " where ll.hospital_id = %s and ll.batch_id = %s and d.doc_type = 'dispense'"
-        " order by d.posted_at, d.id",
+        " group by d.id order by d.posted_at",
         (hospital_id, batch_id),
     )
     return cur.fetchall()
 
 
-def ledger_sum(cur: Cursor, hospital_id: int, batch_id: int, location_id: int) -> Decimal:
+def near_expiry(cur: Cursor, hospital_id: int, today: date, max_days: int) -> list[dict]:
+    """Allocatable balances whose batch expires within max_days (F4 scan and dashboard)."""
     cur.execute(
-        "select coalesce(sum(qty), 0) as total from public.ledger_lines"
-        " where hospital_id = %s and batch_id = %s and location_id = %s",
-        (hospital_id, batch_id, location_id),
+        "select s.batch_id, s.location_id, s.item_id, s.qty, b.expiry_date, b.batch_no,"
+        " i.name as item_name, (b.expiry_date - %s) as days_left"
+        " from public.stock_balances s"
+        " join public.batches b on b.id = s.batch_id"
+        " join public.locations l on l.id = s.location_id"
+        " join public.items i on i.id = s.item_id"
+        " where s.hospital_id = %s and s.qty > 0 and l.allocatable and not b.blocked"
+        " and b.expiry_date <= %s + %s order by b.expiry_date",
+        (today, hospital_id, today, max_days),
     )
-    return cur.fetchone()["total"]
-
-
-def near_expiry(cur: Cursor, hospital_id: int, today: date, window_days: int) -> dict:
-    """Batch-locations with allocatable stock expiring within the window (FR-031)."""
-    cur.execute(
-        "select count(*) as batches, coalesce(sum(sb.qty), 0) as qty"
-        " from public.stock_balances sb"
-        " join public.batches b on b.id = sb.batch_id"
-        " join public.locations l on l.id = sb.location_id"
-        " where sb.hospital_id = %s and sb.qty > 0 and l.allocatable and not b.blocked"
-        "   and b.expiry_date <= %s::date + %s",
-        (hospital_id, today, window_days),
-    )
-    return cur.fetchone()
+    return cur.fetchall()
 
 
 def quarantine_totals(cur: Cursor, hospital_id: int) -> list[dict]:
     cur.execute(
-        "select l.name as location_name, coalesce(sum(sb.qty), 0) as qty"
-        " from public.locations l"
-        " left join public.stock_balances sb on sb.location_id = l.id and sb.qty > 0"
-        " where l.hospital_id = %s and not l.allocatable"
-        " group by l.id, l.name order by l.id",
+        "select l.name as location_name, coalesce(sum(s.qty), 0) as qty"
+        " from public.locations l left join public.stock_balances s on s.location_id = l.id"
+        " where l.hospital_id = %s and not l.allocatable group by l.id order by l.id",
         (hospital_id,),
-    )
-    return cur.fetchall()
-
-
-def expiry_candidates(cur: Cursor, hospital_id: int, last_date: date) -> list[dict]:
-    """Batch-locations with allocatable stock expiring on or before last_date (FR-024)."""
-    cur.execute(
-        "select sb.batch_id, sb.location_id, sb.item_id, sb.qty, b.batch_no, b.expiry_date,"
-        " i.name as item_name"
-        " from public.stock_balances sb"
-        " join public.batches b on b.id = sb.batch_id"
-        " join public.locations l on l.id = sb.location_id"
-        " join public.items i on i.id = sb.item_id"
-        " where sb.hospital_id = %s and sb.qty > 0 and l.allocatable and not b.blocked"
-        "   and b.expiry_date <= %s"
-        " order by b.expiry_date, b.id, l.id",
-        (hospital_id, last_date),
     )
     return cur.fetchall()

@@ -22,7 +22,17 @@ def get_pool() -> ConnectionPool:
         url = get_settings().database_url
         if not url:
             raise AppError(503, "DATABASE_NOT_CONFIGURED", "The database is not configured.")
-        _pool = ConnectionPool(url, min_size=1, max_size=5, open=True, timeout=10)
+        # Check connections before use and keep them alive: dropped connections to the hosted
+        # database otherwise surface as requests that hang until the socket times out.
+        _pool = ConnectionPool(
+            url,
+            min_size=1,
+            max_size=5,
+            open=True,
+            timeout=10,
+            check=ConnectionPool.check_connection,
+            kwargs={"keepalives": 1, "keepalives_idle": 20, "keepalives_interval": 10},
+        )
     return _pool
 
 
@@ -39,9 +49,10 @@ def user_transaction(claims: dict[str, Any]) -> Iterator[Cursor]:
     with get_pool().connection() as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute("set local role authenticated")
+                # One round trip: set_config('role', …, true) is SET LOCAL ROLE.
                 cur.execute(
-                    "select set_config('request.jwt.claims', %s, true),"
+                    "select set_config('role', 'authenticated', true),"
+                    " set_config('request.jwt.claims', %s, true),"
                     " set_config('request.jwt.claim.sub', %s, true)",
                     (json.dumps(claims), str(claims["sub"])),
                 )

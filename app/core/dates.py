@@ -1,4 +1,5 @@
-"""Dates in the hospital's configured time zone (constitution: single configured time zone)."""
+"""Dates in the hospital's configured time zone (constitution: one time zone for every
+date-sensitive rule, default Asia/Kolkata)."""
 
 from datetime import date
 
@@ -10,5 +11,4 @@ def hospital_today(cur: Cursor, hospital_id: int) -> date:
         "select (now() at time zone time_zone)::date as today from public.hospitals where id = %s",
         (hospital_id,),
     )
-    row = cur.fetchone()
-    return row["today"] if row else date.today()
+    return cur.fetchone()["today"]

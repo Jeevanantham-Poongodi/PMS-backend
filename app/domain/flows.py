@@ -1,8 +1,5 @@
-"""The case engine (FR-001 to FR-005, research R1 and R5).
-
-A case is always at one node of its flow. Only the outgoing arrows of that node that the data
-allows are offered; taking one runs its effect, records the move in the append-only history and
-writes an audit entry, all in one transaction.
+"""The case engine (FR-001–FR-005): a case is always at one node of its flow, can only take an
+outgoing arrow of that node, and every move is recorded with its audit entry in one transaction.
 """
 
 from collections.abc import Callable
@@ -13,156 +10,109 @@ from typing import Any
 from psycopg import Cursor
 
 from app.core.auth import CurrentUser
+from app.core.config import get_settings
 from app.core.errors import AppError
-from app.domain import stock
 from app.domain.effects import EFFECTS, GUARDS, Ctx
-from app.flows.definitions import FLOWS, Edge, get_flow, is_end, outgoing
+from app.flows.definitions import FLOWS, Edge, Flow, get_flow
 from app.repositories import audit
 from app.repositories import cases as repo
-from app.repositories import masters as masters_repo
-from app.repositories import stock as stock_repo
 
 TxFactory = Callable[[], AbstractContextManager[Cursor]]
 
-WARD_KINDS = ("ward", "ot", "icu")
-# Case details each flow's start form may set; anything else in `data` is ignored.
-START_DATA = {
-    1: ("trigger", "vendor_id"),
-    2: ("ward_location_id",),
-    3: ("order_type", "patient_ref", "prescriber"),
-    5: ("batch_id", "source"),
-}
 
-
-def invalid(message: str, field: str | None = None) -> AppError:
-    details = [{"field": field, "message": message}] if field else None
-    return AppError(422, "VALIDATION_FAILED", message, details)
-
-
-# Definitions --------------------------------------------------------------------------------------
-
-
-def edge_dict(edge: Edge) -> dict:
-    return {
-        "id": edge.id,
-        "from": edge.source,
-        "to": edge.target,
-        "outcome": edge.outcome,
-        "approval": edge.approval,
-        "reason": edge.reason,
-        "inputs": list(edge.inputs),
-    }
-
-
-def flow_definitions(user: CurrentUser) -> list[dict]:
+def definitions(user: CurrentUser) -> list[Flow]:
     user.require("flows.read")
-    return [
-        {
-            "flow": f.flow,
-            "title": f.title,
-            "starts": list(f.starts),
-            "nodes": [{"key": n.key, "label": n.label, "kind": n.kind} for n in f.nodes],
-            "edges": [edge_dict(e) for e in f.edges],
-        }
-        for f in FLOWS.values()
-    ]
+    return list(FLOWS.values())
 
 
-def node_label(flow: int, node: str) -> str:
-    found = get_flow(flow).node(node)
-    return found.label if found else node
+def _flow(number: int) -> Flow:
+    flow = get_flow(number)
+    if flow is None:
+        raise AppError(404, "NOT_FOUND", "No such flow.")
+    return flow
 
 
-# Reading ------------------------------------------------------------------------------------------
+def _ctx(cur: Cursor, user: CurrentUser, case: dict, edge: Edge | None = None, **kw: Any) -> Ctx:
+    return Ctx(
+        cur=cur,
+        user=user,
+        case=case,
+        lines=repo.get_lines(cur, user.hospital_id, case["id"]),
+        data=dict(case["data"] or {}),
+        edge=edge,  # type: ignore[arg-type]
+        input=kw.get("input") or {},
+        note=kw.get("note"),
+        request_id=kw.get("request_id"),
+    )
 
 
-def _summary(case: dict) -> dict:
-    return {
-        "id": case["id"],
-        "flow": case["flow"],
-        "node": case["node"],
-        "node_label": node_label(case["flow"], case["node"]),
-        "title": case["title"],
-        "closed": case["closed"],
-        "parent_case_id": case["parent_case_id"],
-        "created_at": case["created_at"],
-        "updated_at": case["updated_at"],
-    }
-
-
-def _ctx(cur: Cursor, user: CurrentUser, case: dict, demo_mode: bool = False) -> Ctx:
-    lines = repo.get_lines(cur, user.hospital_id, case["id"])
-    return Ctx(cur=cur, user=user, case=case, lines=lines, data=dict(case["data"] or {}),
-               demo_mode=demo_mode)
-
-
-def available_actions(ctx: Ctx) -> list[Edge]:
-    """FR-002: the outgoing arrows of the current node that the data allows (R2)."""
+def available_edges(ctx: Ctx) -> list[Edge]:
     if ctx.case["closed"]:
         return []
-    return [
-        e for e in outgoing(ctx.case["flow"], ctx.case["node"])
-        if e.guard is None or GUARDS[e.guard](ctx)
-    ]
+    flow = _flow(ctx.case["flow"])
+    return [e for e in flow.outgoing(ctx.case["node"]) if e.guard is None or GUARDS[e.guard](ctx)]
 
 
-def _detail(cur: Cursor, user: CurrentUser, case_id: int) -> dict:
-    case = repo.get_case(cur, user.hospital_id, case_id)
-    if case is None:
-        raise AppError(404, "NOT_FOUND", "Case not found.")
+def _detail(cur: Cursor, user: CurrentUser, case: dict) -> dict:
     ctx = _ctx(cur, user, case)
+    flow = _flow(case["flow"])
     return {
-        **_summary(case),
-        "data": case["data"] or {},
+        **case,
+        "node_label": flow.node(case["node"]).label,
         "lines": ctx.lines,
-        "events": repo.get_events(cur, user.hospital_id, case_id),
-        "actions": [edge_dict(e) for e in available_actions(ctx)],
-        "child_case_ids": repo.child_case_ids(cur, user.hospital_id, case_id),
+        "events": repo.get_events(cur, user.hospital_id, case["id"]),
+        "actions": available_edges(ctx),
+        "child_case_ids": repo.child_case_ids(cur, user.hospital_id, case["id"]),
     }
+
+
+def summary(case: dict) -> dict:
+    return {**case, "node_label": _flow(case["flow"]).node(case["node"]).label}
 
 
 def list_cases(
-    user: CurrentUser, tx: TxFactory, flow: int | None, node: str | None, open_: bool | None
+    user: CurrentUser, tx: TxFactory, flow: int | None, node: str | None, open_only: bool | None
 ) -> list[dict]:
     user.require("flows.read")
     with tx() as cur:
-        return [_summary(c) for c in repo.list_cases(cur, user.hospital_id, flow, node, open_)]
+        return [summary(c) for c in repo.list_cases(cur, user.hospital_id, flow, node, open_only)]
 
 
 def get_case(user: CurrentUser, tx: TxFactory, case_id: int) -> dict:
     user.require("flows.read")
     with tx() as cur:
-        return _detail(cur, user, case_id)
-
-
-# Raising a case -----------------------------------------------------------------------------------
+        case = repo.get_case(cur, user.hospital_id, case_id)
+        if case is None:
+            raise AppError(404, "NOT_FOUND", "Case not found.")
+        return _detail(cur, user, case)
 
 
 def open_case(
     cur: Cursor,
     user: CurrentUser,
-    *,
-    flow: int,
+    flow_number: int,
     start: str,
     title: str,
     data: dict,
     lines: list[dict],
-    parent_case_id: int | None = None,
-    request_id: str | None = None,
-) -> int:
-    """Inserts a case at a start node with its lines, first history entry and audit entry.
-    Also used by effects that open linked cases."""
-    case = repo.insert_case(cur, user.hospital_id, flow, start, title, data, parent_case_id)
+    request_id: str | None,
+) -> dict:
+    flow = _flow(flow_number)
+    if start not in flow.starts:
+        raise AppError(422, "VALIDATION_FAILED", f"{start} is not a start of flow {flow_number}.")
+    case = repo.insert_case(cur, user.hospital_id, flow_number, start, title, data, None)
     for line in lines:
+        qty = Decimal(str(line["qty"]))
+        if qty <= 0:
+            raise AppError(422, "VALIDATION_FAILED", "Quantities must be greater than zero.")
         repo.insert_line(
             cur,
             user.hospital_id,
             case["id"],
-            line["item_id"],
-            stock.to_qty(line["qty"]),
+            int(line["item_id"]),
+            qty,
             line.get("batch_id"),
             line.get("location_id"),
-            line.get("qty_approved"),
         )
     repo.insert_event(cur, user.hospital_id, case["id"], None, None, start, None, None)
     audit.append(
@@ -171,93 +121,29 @@ def open_case(
         action="create",
         entity_type="flow_case",
         entity_id=str(case["id"]),
-        after={"flow": flow, "node": start, "title": title, "parent_case_id": parent_case_id},
+        after={"flow": flow_number, "node": start, "title": title},
         request_id=request_id,
     )
-    return case["id"]
+    return case
 
 
-def _check_start(cur: Cursor, user: CurrentUser, body: dict) -> tuple[dict, list[dict]]:
-    """Validates the start form of each flow; returns the case data and lines to store."""
-    flow, start = body["flow"], body["start"]
-    if flow == 4:
-        raise invalid("Expiry cases are raised by the daily expiry scan.", "flow")
-    if start not in get_flow(flow).starts:
-        raise invalid("That is not a start step of this flow.", "start")
-    given = body.get("data") or {}
-    data = {k: given[k] for k in START_DATA[flow] if given.get(k) not in (None, "")}
-    lines = body.get("lines") or []
-    hid = user.hospital_id
-
-    if flow == 5:
-        if not data.get("batch_id"):
-            raise invalid("Choose the recalled batch.", "data.batch_id")
-        batch = masters_repo.get_batch(cur, hid, int(data["batch_id"]))
-        if batch is None:
-            raise invalid("Unknown batch.", "data.batch_id")
-        if data.get("source") not in ("regulator", "vendor"):
-            raise invalid("Say whether the notice came from the regulator or the vendor.",
-                          "data.source")
-        data["batch_id"] = batch["id"]
-        held = sum((h["qty"] for h in stock_repo.batch_holdings(cur, hid, batch["id"])),
-                   Decimal(0))
-        return data, [{"item_id": batch["item_id"], "batch_id": batch["id"], "qty": held}]
-
-    if not lines:
-        raise invalid("Add at least one line.", "lines")
-    items = masters_repo.get_items(cur, hid, [ln["item_id"] for ln in lines])
-    for line in lines:
-        item = items.get(line["item_id"])
-        if item is None or not item["active"]:
-            raise invalid("Every line needs an active item.", "lines")
-
-    if flow == 1:
-        if start == "f1_need" and data.get("trigger") not in ("reorder_level", "department_need"):
-            raise invalid("Choose what triggered the requisition.", "data.trigger")
-        if start == "f1_emergency":
-            if not data.get("vendor_id") or masters_repo.get_vendor(
-                cur, hid, int(data["vendor_id"])
-            ) is None:
-                raise invalid("Choose the vendor the emergency purchase came from.",
-                              "data.vendor_id")
-            data["vendor_id"] = int(data["vendor_id"])
-    elif flow == 2:
-        ward = masters_repo.get_location(cur, hid, int(data.get("ward_location_id") or 0))
-        if ward is None or ward["kind"] not in WARD_KINDS:
-            raise invalid("Choose the ward, OT or ICU raising the indent.",
-                          "data.ward_location_id")
-        data["ward_location_id"] = ward["id"]
-    elif flow == 3:
-        if data.get("order_type") not in ("IP", "OP"):
-            raise invalid("Choose IP or OP.", "data.order_type")
-        for key in ("patient_ref", "prescriber"):
-            data[key] = str(data.get(key) or "").strip()
-            if not data[key]:
-                raise invalid(f"Enter the {key.replace('_', ' ')}.", f"data.{key}")
-    return data, lines
-
-
-def create_case(user: CurrentUser, tx: TxFactory, body: dict, request_id: str) -> dict:
+def create_case(user: CurrentUser, tx: TxFactory, body: dict, request_id: str | None) -> dict:
     user.require("flows.write")
     with tx() as cur:
-        data, lines = _check_start(cur, user, body)
-        case_id = open_case(
+        case = open_case(
             cur,
             user,
-            flow=body["flow"],
-            start=body["start"],
-            title=body["title"],
-            data=data,
-            lines=lines,
-            request_id=request_id,
+            body["flow"],
+            body["start"],
+            body["title"],
+            body.get("data") or {},
+            body.get("lines") or [],
+            request_id,
         )
-        return _detail(cur, user, case_id)
+        return _detail(cur, user, case)
 
 
-# Moving a case ------------------------------------------------------------------------------------
-
-
-def move_case(
+def move(
     cur: Cursor,
     user: CurrentUser,
     case_id: int,
@@ -265,36 +151,32 @@ def move_case(
     note: str | None,
     input_: dict | None,
     request_id: str | None,
-    demo_mode: bool,
-) -> None:
-    """Takes one arrow inside an open transaction. Used by the API and the demo-data loader."""
+) -> dict:
+    """Takes one arrow. Raises before anything is written if the move is not allowed."""
     case = repo.get_case(cur, user.hospital_id, case_id, for_update=True)
     if case is None:
         raise AppError(404, "NOT_FOUND", "Case not found.")
     if case["closed"]:
         raise AppError(409, "CASE_CLOSED", "This case is closed.")
-    ctx = _ctx(cur, user, case, demo_mode)
-    edge = next((e for e in outgoing(case["flow"], case["node"]) if e.id == edge_id), None)
-    if edge is None or edge not in available_actions(ctx):
-        raise AppError(
-            409, "INVALID_TRANSITION", "That step is not available from where this case is now.",
-            {"node": case["node"], "edge": edge_id},
-        )
+    flow = _flow(case["flow"])
+    edge = flow.edge(edge_id)
     note = (note or "").strip() or None
+    ctx = _ctx(cur, user, case, edge, input=input_, note=note, request_id=request_id)
+    if edge is None or edge not in available_edges(ctx):
+        raise AppError(
+            409, "INVALID_TRANSITION", "That outcome is not available from the case's current step."
+        )
     if edge.reason and not note:
-        raise invalid("A reason is required for this outcome.", "note")
+        raise AppError(422, "VALIDATION_FAILED", "A reason is required for this outcome.")
     if edge.approval:
         user.require("flows.approve")
-        if not demo_mode and str(case["raised_by"]) == user.user_id:
+        if str(case["raised_by"]) == str(user.user_id) and not get_settings().demo_mode:
             raise AppError(
-                403, "SELF_APPROVAL_FORBIDDEN", "The person who raised a case cannot approve it."
+                403, "SELF_APPROVAL_FORBIDDEN", "The person who raised this case cannot approve it."
             )
-
-    ctx.edge, ctx.input, ctx.note, ctx.request_id = edge, input_ or {}, note, request_id
     if edge.effect:
         EFFECTS[edge.effect](ctx)
-
-    closed = is_end(case["flow"], edge.target)
+    closed = flow.node(edge.target).kind == "end"
     repo.update_case(cur, user.hospital_id, case_id, edge.target, closed, ctx.data)
     repo.insert_event(
         cur, user.hospital_id, case_id, case["node"], edge.outcome, edge.target, note, input_
@@ -307,23 +189,22 @@ def move_case(
         entity_id=str(case_id),
         before={"node": case["node"]},
         after={"node": edge.target, "outcome": edge.outcome},
-        reason=note if edge.reason else None,
+        reason=note,
         request_id=request_id,
     )
+    return repo.get_case(cur, user.hospital_id, case_id)
 
 
 def take_action(
     user: CurrentUser,
     tx: TxFactory,
     case_id: int,
-    body: dict[str, Any],
-    request_id: str,
-    demo_mode: bool,
+    edge_id: str,
+    note: str | None,
+    input_: dict | None,
+    request_id: str | None,
 ) -> dict:
     user.require("flows.write")
     with tx() as cur:
-        move_case(
-            cur, user, case_id, body["edge"], body.get("note"), body.get("input"), request_id,
-            demo_mode,
-        )
-        return _detail(cur, user, case_id)
+        case = move(cur, user, case_id, edge_id, note, input_, request_id)
+        return _detail(cur, user, case)

@@ -178,9 +178,9 @@ class Item(Base):
 Index("items_hospital_name_key", Item.hospital_id, func.lower(Item.name), unique=True)
 
 
-# ---------------------------------------------------------------------------------------------
-# Feature 002 — Flow pages: masters, stock ledger and cases (specs/002-flow-pages/data-model.md)
-# ---------------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Feature 002: masters, stock ledger and flow cases (specs/002-flow-pages/data-model.md)
+# ---------------------------------------------------------------------------
 
 LOCATION_KINDS = (
     "central_store",
@@ -249,9 +249,8 @@ class Batch(Base):
     batch_no: Mapped[str] = mapped_column(Text)
     expiry_date: Mapped[date] = mapped_column(Date)
     vendor_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("vendors.id"))
-    # Set by F5:"Block and quarantine batches"; a blocked batch is never allocated.
     blocked: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
-    # FEFO tie-break (D-005 step 2).
+    # FEFO tie-break, D-005 step 2: set at the batch's first receipt.
     first_receipt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
@@ -265,8 +264,60 @@ class HospitalSetting(Base):
     value: Mapped[Any] = mapped_column(JSONB)
 
 
+class FlowCase(Base):
+    __tablename__ = "flow_cases"
+    __table_args__ = (CheckConstraint("flow between 1 and 5", name="flow_cases_flow_check"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    hospital_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("hospitals.id"))
+    flow: Mapped[int] = mapped_column(SmallInteger)
+    node: Mapped[str] = mapped_column(Text)
+    title: Mapped[str] = mapped_column(Text)
+    data: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=text("'{}'::jsonb"))
+    parent_case_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("flow_cases.id"))
+    closed: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    raised_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), server_default=text("auth.uid()")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+Index("flow_cases_hospital_flow_idx", FlowCase.hospital_id, FlowCase.flow, FlowCase.closed)
+
+
+class FlowCaseLine(Base):
+    __tablename__ = "flow_case_lines"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    hospital_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("hospitals.id"))
+    case_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("flow_cases.id"))
+    item_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("items.id"))
+    batch_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("batches.id"))
+    location_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("locations.id"))
+    qty_requested: Mapped[Decimal] = mapped_column(Numeric(12, 2))
+    qty_approved: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
+
+
+class FlowEvent(Base):
+    """Append-only history of a case's moves through the diagram."""
+
+    __tablename__ = "flow_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    hospital_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("hospitals.id"))
+    case_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("flow_cases.id"))
+    from_node: Mapped[str | None] = mapped_column(Text)
+    outcome: Mapped[str | None] = mapped_column(Text)
+    to_node: Mapped[str] = mapped_column(Text)
+    actor: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), server_default=text("auth.uid()"))
+    note: Mapped[str | None] = mapped_column(Text)
+    input: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class StockDocument(Base):
-    """Append-only (trigger)."""
+    """A posted stock movement (constitution II). Append-only."""
 
     __tablename__ = "stock_documents"
     __table_args__ = (
@@ -287,13 +338,10 @@ class StockDocument(Base):
 
 
 class LedgerLine(Base):
-    """Append-only (trigger); each insert updates stock_balances through app.apply_ledger_line."""
+    """Signed quantity per item, batch and location. Append-only; balances follow by trigger."""
 
     __tablename__ = "ledger_lines"
-    __table_args__ = (
-        CheckConstraint("qty <> 0", name="ledger_lines_qty_check"),
-        Index("ledger_lines_batch_idx", "hospital_id", "batch_id"),
-    )
+    __table_args__ = (CheckConstraint("qty <> 0", name="ledger_lines_qty_check"),)
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
     hospital_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("hospitals.id"))
@@ -305,8 +353,11 @@ class LedgerLine(Base):
     posted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+Index("ledger_lines_batch_idx", LedgerLine.hospital_id, LedgerLine.batch_id)
+
+
 class StockBalance(Base):
-    """Written only by the ledger trigger; can never go negative (FR-012)."""
+    """Maintained only by the ledger trigger. The check makes any negative posting fail."""
 
     __tablename__ = "stock_balances"
     __table_args__ = (CheckConstraint("qty >= 0", name="stock_balances_qty_check"),)
@@ -322,61 +373,8 @@ class StockBalance(Base):
     qty: Mapped[Decimal] = mapped_column(Numeric(12, 2))
 
 
-class FlowCase(Base):
-    __tablename__ = "flow_cases"
-    __table_args__ = (
-        CheckConstraint("flow >= 1 and flow <= 5", name="flow_cases_flow_check"),
-        Index("flow_cases_hospital_flow_idx", "hospital_id", "flow", "closed"),
-    )
-
-    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
-    hospital_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("hospitals.id"))
-    flow: Mapped[int] = mapped_column(SmallInteger)
-    # A node key of the flow, validated against app.flows.definitions.
-    node: Mapped[str] = mapped_column(Text)
-    title: Mapped[str] = mapped_column(Text)
-    data: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=text("'{}'::jsonb"))
-    parent_case_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("flow_cases.id"))
-    closed: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
-    raised_by: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), server_default=text("auth.uid()")
-    )
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-
-class FlowCaseLine(Base):
-    __tablename__ = "flow_case_lines"
-
-    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
-    hospital_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("hospitals.id"))
-    case_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("flow_cases.id"))
-    item_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("items.id"))
-    batch_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("batches.id"))
-    location_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("locations.id"))
-    qty_requested: Mapped[Decimal] = mapped_column(Numeric(12, 2))
-    qty_approved: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
-
-
-class FlowEvent(Base):
-    """Append-only (trigger): one move through the diagram (FR-003)."""
-
-    __tablename__ = "flow_events"
-
-    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
-    hospital_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("hospitals.id"))
-    case_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("flow_cases.id"))
-    from_node: Mapped[str | None] = mapped_column(Text)
-    outcome: Mapped[str | None] = mapped_column(Text)
-    to_node: Mapped[str] = mapped_column(Text)
-    actor: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), server_default=text("auth.uid()"))
-    note: Mapped[str | None] = mapped_column(Text)
-    input: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-
 class NdpsRegister(Base):
-    """Append-only (trigger). Two sign-offs; different users unless demo mode (D-018)."""
+    """NDPS / Schedule X register (constitution VI). Append-only."""
 
     __tablename__ = "ndps_register"
 

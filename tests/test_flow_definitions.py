@@ -1,88 +1,113 @@
-"""The flow definitions match the spec's Branch Inventory (SC-001): every arrow exists with the
-diagram's outcome, every node is reachable, only end nodes have no way out."""
+"""The flow definitions match the spec's Branch Inventory exactly (SC-001, constitution XIV).
+
+The inventory tables in specs/002-flow-pages/spec.md are parsed and compared with
+app/flows/definitions.py, so a change to either without the other fails here.
+"""
 
 import re
 from pathlib import Path
 
 import pytest
 
-from app.flows.definitions import FLOWS, INTERNAL_STARTS, outgoing
+from app.flows.definitions import FLOWS
 
-SPEC = Path(__file__).resolve().parents[2] / "specs" / "002-flow-pages" / "speck.md"
+SPEC = Path(__file__).resolve().parents[2] / "specs" / "002-flow-pages" / "spec.md"
 ROW = re.compile(r'^\| `F(\d):"(.+?)"` \| (.+?) \| `F\d:"(.+?)"`')
 
+# Starts added by clarification, not by an arrow in the diagram (spec, Clarifications 2026-10-22).
+CLARIFIED_STARTS = {(4, "Expired: quarantine")}
 
-def branch_inventory() -> list[tuple[int, str, str | None, str]]:
-    rows = []
-    for line in SPEC.read_text(encoding="utf-8").splitlines():
+
+def inventory() -> set[tuple[int, str, str | None, str]]:
+    rows = set()
+    for line in SPEC.read_text().splitlines():
         match = ROW.match(line)
         if match:
             flow, source, outcome, target = match.groups()
-            rows.append((int(flow), source, None if outcome == "—" else outcome, target))
+            outcome = outcome.strip()
+            rows.add((int(flow), source, None if outcome == "—" else outcome, target))
     return rows
 
 
-def label_index(flow: int) -> dict[str, str]:
-    return {n.label: n.key for n in FLOWS[flow].nodes}
+def defined() -> set[tuple[int, str, str | None, str]]:
+    rows = set()
+    for flow in FLOWS.values():
+        for edge in flow.edges:
+            rows.add(
+                (
+                    flow.number,
+                    flow.node(edge.source).label,
+                    edge.outcome,
+                    flow.node(edge.target).label,
+                )
+            )
+    return rows
 
 
-@pytest.mark.skipif(not SPEC.exists(), reason="spec not in this checkout")
-def test_every_branch_inventory_row_is_an_edge():
-    rows = branch_inventory()
-    assert len(rows) > 90
-    for flow, source, outcome, target in rows:
-        keys = label_index(flow)
-        assert source in keys, f"F{flow} node missing: {source}"
-        assert target in keys, f"F{flow} node missing: {target}"
-        edges = [e for e in outgoing(flow, keys[source]) if e.target == keys[target]]
-        assert edges, f"F{flow}: no arrow {source} -> {target}"
-        # Outcome labels follow the diagram; "Stock received (via Flow 1)" is stored as
-        # "Stock received", as in the recorded history.
-        expected = outcome.replace(" (via Flow 1)", "") if outcome else None
-        assert any(e.outcome == expected for e in edges), f"F{flow}: {source} {outcome}"
+def normalise(rows):
+    # The spec annotates one outcome with where the stock comes from; the label is the diagram's.
+    return {(f, s, (o or "").replace(" (via Flow 1)", "") or None, t) for f, s, o, t in rows}
 
 
-@pytest.mark.skipif(not SPEC.exists(), reason="spec not in this checkout")
-def test_no_edge_beyond_the_branch_inventory():
-    assert sum(len(f.edges) for f in FLOWS.values()) == len(branch_inventory())
+def test_spec_inventory_was_parsed():
+    assert len(inventory()) > 100
 
 
-@pytest.mark.parametrize("flow", sorted(FLOWS))
+def test_every_inventory_arrow_is_defined_and_nothing_else():
+    assert normalise(inventory()) == normalise(defined())
+
+
+@pytest.mark.parametrize("flow", FLOWS.values(), ids=lambda f: f.title)
 def test_every_node_is_reachable_from_a_start(flow):
-    definition = FLOWS[flow]
-    seen = set(definition.starts) | set(INTERNAL_STARTS.get(flow, ()))
-    frontier = list(seen)
+    reached, frontier = set(flow.starts), list(flow.starts)
     while frontier:
-        node = frontier.pop()
-        for edge in outgoing(flow, node):
-            if edge.target not in seen:
-                seen.add(edge.target)
+        for edge in flow.outgoing(frontier.pop()):
+            if edge.target not in reached:
+                reached.add(edge.target)
                 frontier.append(edge.target)
-    assert seen == {n.key for n in definition.nodes}
+    assert reached == {n.key for n in flow.nodes}
 
 
-@pytest.mark.parametrize("flow", sorted(FLOWS))
-def test_only_end_nodes_have_no_outgoing_arrow(flow):
-    for node in FLOWS[flow].nodes:
-        assert (node.kind == "end") == (not outgoing(flow, node.key)), node.key
+@pytest.mark.parametrize("flow", FLOWS.values(), ids=lambda f: f.title)
+def test_only_end_nodes_have_no_way_out(flow):
+    for node in flow.nodes:
+        assert bool(flow.outgoing(node.key)) == (node.kind != "end"), node.label
 
 
-def test_edge_ids_are_unique():
-    ids = [e.id for f in FLOWS.values() for e in f.edges]
+@pytest.mark.parametrize("flow", FLOWS.values(), ids=lambda f: f.title)
+def test_edge_ids_are_unique(flow):
+    ids = [e.id for e in flow.edges]
     assert len(ids) == len(set(ids))
 
 
-def test_approval_edges_are_exactly_fr_004():
-    approval_nodes = {e.source for f in FLOWS.values() for e in f.edges if e.approval}
-    assert approval_nodes == {
-        "f1_committee", "f1_hod", "f1_finance", "f1_retro", "f2_review", "f4_writeoff"
-    }
+def test_starts_are_diagram_starts_or_clarified():
     for flow in FLOWS.values():
-        for edge in flow.edges:
-            if edge.source in approval_nodes:
-                assert edge.approval, edge.id
+        for start in flow.starts:
+            node = flow.node(start)
+            assert node.kind == "start" or (flow.number, node.label) in CLARIFIED_STARTS
 
 
-def test_reason_edges_lead_into_exactly_fr_005_nodes():
-    reason_targets = {e.target for f in FLOWS.values() for e in f.edges if e.reason}
-    assert reason_targets == {"f2_return_ward", "f1_reject", "f3_query", "f4_investigate"}
+def test_approval_edges_are_exactly_fr004():
+    approval_nodes = {
+        (f.number, f.node(e.source).label) for f in FLOWS.values() for e in f.edges if e.approval
+    }
+    assert approval_nodes == {
+        (1, "Committee approves?"),
+        (1, "HOD approves requisition?"),
+        (1, "Finance approves PO?"),
+        (1, "Retrospective approval?"),
+        (2, "Pharmacist reviews indent"),
+        (4, "Write-off approved?"),
+    }
+
+
+def test_reason_edges_lead_to_fr005_nodes():
+    reason_targets = {
+        (f.number, f.node(e.target).label) for f in FLOWS.values() for e in f.edges if e.reason
+    }
+    assert {
+        (2, "Return to ward with reason"),
+        (1, "Reject: notify requester, suggest formulary alternative"),
+        (3, "Query to prescriber"),
+        (4, "Investigate loss"),
+    } <= reason_targets

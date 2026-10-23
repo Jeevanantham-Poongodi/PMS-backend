@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
@@ -53,21 +54,23 @@ class Health(BaseModel):
     database: Literal["ok", "unreachable", "not_configured"]
 
 
-# Flow pages (feature 002, specs/002-flow-pages/contracts/openapi.yaml) ---------------------------
+# ---------------------------------------------------------------------------
+# Feature 002 (specs/002-flow-pages/contracts/openapi.yaml)
+# ---------------------------------------------------------------------------
+
+Qty = Annotated[Decimal, Field(gt=0, max_digits=12, decimal_places=2)]
 
 
-class FlowNode(BaseModel):
+class NodeOut(BaseModel):
     key: str
     label: str
     kind: Literal["start", "task", "decision", "end"]
 
 
-class FlowEdge(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
-
+class EdgeOut(BaseModel):
     id: str
-    from_: str = Field(alias="from")
-    to: str
+    source: str = Field(serialization_alias="from")
+    target: str = Field(serialization_alias="to")
     outcome: str | None
     approval: bool
     reason: bool
@@ -78,15 +81,15 @@ class FlowDefinition(BaseModel):
     flow: int
     title: str
     starts: list[str]
-    nodes: list[FlowNode]
-    edges: list[FlowEdge]
+    nodes: list[NodeOut]
+    edges: list[EdgeOut]
 
 
 class LineInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     item_id: int
-    qty: float = Field(gt=0)
+    qty: Qty
     batch_id: int | None = None
     location_id: int | None = None
 
@@ -94,11 +97,11 @@ class LineInput(BaseModel):
 class CaseCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    flow: int = Field(ge=1, le=5)
-    start: str
+    flow: Annotated[int, Field(ge=1, le=5)]
+    start: Text
     title: Text
-    data: dict[str, Any] = Field(default_factory=dict)
-    lines: list[LineInput] = Field(default_factory=list)
+    data: dict[str, Any] = {}
+    lines: list[LineInput] = []
 
 
 class CaseSummary(BaseModel):
@@ -122,8 +125,8 @@ class CaseLine(BaseModel):
     expiry_date: date | None
     location_id: int | None
     location_name: str | None
-    qty_requested: float
-    qty_approved: float | None
+    qty_requested: Decimal
+    qty_approved: Decimal | None
 
 
 class CaseEvent(BaseModel):
@@ -140,15 +143,15 @@ class CaseDetail(CaseSummary):
     data: dict[str, Any]
     lines: list[CaseLine]
     events: list[CaseEvent]
-    actions: list[FlowEdge]
+    actions: list[EdgeOut]
     child_case_ids: list[int]
 
 
 class ActionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    edge: str
-    note: Annotated[str, StringConstraints(max_length=1000)] | None = None
+    edge: Text
+    note: Annotated[str, StringConstraints(strip_whitespace=True, max_length=1000)] | None = None
     input: dict[str, Any] | None = None
 
 
@@ -190,13 +193,13 @@ class Balance(BaseModel):
     batch_no: str
     expiry_date: date
     blocked: bool
-    qty: float
+    qty: Decimal
 
 
 class Dispensed(BaseModel):
     patient_ref: str | None
     prescriber: str | None
-    qty: float
+    qty: Decimal
     posted_at: datetime
 
 
@@ -206,25 +209,25 @@ class BatchTrace(BaseModel):
     dispensed: list[Dispensed]
 
 
-class OpenCases(BaseModel):
+class NodeCount(BaseModel):
     flow: int
     node: str
     node_label: str
     count: int
 
 
-class NearExpiry(BaseModel):
+class ExpiryBucket(BaseModel):
     window_days: int
     batches: int
-    qty: float
+    qty: Decimal
 
 
 class QuarantineTotal(BaseModel):
     location_name: str
-    qty: float
+    qty: Decimal
 
 
 class Dashboard(BaseModel):
-    open_cases: list[OpenCases]
-    near_expiry: list[NearExpiry]
+    open_cases: list[NodeCount]
+    near_expiry: list[ExpiryBucket]
     quarantine: list[QuarantineTotal]

@@ -1,120 +1,119 @@
 # PMS Backend
 
-The API for the Pharmacy Management System (PMS). It is built with [FastAPI](https://fastapi.tiangolo.com/) and uses [Supabase](https://supabase.com/) as its database.
+The API for the Pharmacy Management System: FastAPI on Python 3.12, talking to Supabase
+PostgreSQL with psycopg 3. Schema changes are Alembic migrations.
 
-The frontend lives in a separate repository: [PMS-frontend](https://github.com/Jeevanantham-Poongodi/PMS-frontend).
-
-> **Status:** early setup. The API currently has health and connection-test endpoints only. The pharmacy features (master data, stock ledger, access control, audit trail) are planned.
-
-## Tech stack
-
-- Python 3.12
-- FastAPI, served by Uvicorn
-- Supabase Python client
-- Docker and Docker Compose
-- GitHub Actions to build the image and deploy it to AWS EC2
-
-## Project structure
-
-```
-backend/
-├── main.py                  # FastAPI app, CORS setup and endpoints
-├── requirements.txt         # Python dependencies
-├── Dockerfile               # Container image (python:3.12-slim, non-root user)
-├── docker-compose.yml       # Local development: builds the image from this folder
-├── docker-compose.prod.yml  # Production: pulls the prebuilt image from GHCR
-├── .dockerignore
-└── .github/workflows/
-    └── deploy.yml           # Build, push and deploy pipeline
-```
-
-## Environment variables
-
-Create a `.env` file in the `backend/` folder:
-
-```env
-SUPABASE_URL=https://<your-project>.supabase.co
-SUPABASE_KEY=<your-supabase-key>
-```
-
-| Variable       | Description                                              |
-| -------------- | -------------------------------------------------------- |
-| `SUPABASE_URL` | Your Supabase project URL                                |
-| `SUPABASE_KEY` | Your Supabase API key (from Project Settings → API)      |
-
-`.env` is listed in `.gitignore` and `.dockerignore`. Never commit it.
-
-## Running locally
-
-### Option 1: Python virtual environment
+## Setup
 
 ```bash
-python -m venv venv
-
-# Windows
-venv\Scripts\activate
-# macOS / Linux
-source venv/bin/activate
-
-pip install -r requirements.txt
-uvicorn main:app --reload
+python -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
 ```
 
-The API runs at http://localhost:8000.
+Create `backend/.env` (git-ignored; [.env.example](.env.example) lists the keys):
 
-### Option 2: Docker Compose
+| Variable | What it is |
+| --- | --- |
+| `SUPABASE_URL` | Supabase project URL |
+| `DATABASE_URL` | Postgres connection string (Supabase → Connect → Session pooler) |
+| `SUPABASE_JWT_MODE` | `jwks` for projects with signing keys (the default), else `secret` |
+| `SUPABASE_JWT_SECRET` | Only for `secret` mode |
+| `CORS_ORIGINS` | Browser origins allowed to call the API, e.g. `http://localhost:5173` |
+| `SUPABASE_KEY` | Service-role key. Used only by `scripts/bootstrap.py demo-user`; never by the API |
+| `DEMO_MODE` | `true` for the demo: one account may approve its own cases and give both NDPS sign-offs (D-018) |
+
+## Database migrations
 
 ```bash
-docker compose up --build
+.venv/bin/alembic upgrade head      # apply
+.venv/bin/alembic current           # where the database is
+.venv/bin/alembic check             # models and database match
 ```
 
-This builds the image, loads `.env`, exposes port `8000` and runs a health check against `/` every 30 seconds.
+To add a table: add a model to [app/models.py](app/models.py), run
+`alembic revision --autogenerate -m "..."`, then add row-level security, grants and policies by
+hand in the new revision (the template reminds you). Never change the schema in the Supabase
+dashboard.
 
-To stop it:
+| Revision | Contents |
+| --- | --- |
+| 0001 | Hospitals, members, roles, permissions, audit trail, items |
+| 0002 | Locations, vendors, batches, stock ledger and balances, flow cases, NDPS register, settings |
+| 0003 | Fix: balance trigger for outgoing stock |
+
+## Demo account and data
 
 ```bash
-docker compose down
+.venv/bin/python scripts/bootstrap.py demo-user --email demo@pharmacy.local --password '<password>'
+.venv/bin/python scripts/bootstrap.py demo-data     # once, into the account's hospital
+.venv/bin/python scripts/bootstrap.py demo-reset    # a fresh copy before each presentation
 ```
 
-## API endpoints
+- `demo-user` creates the sign-in account (needs `SUPABASE_KEY`), a hospital if none exists, and
+  makes the account its administrator.
+- `demo-data` loads fictional locations, vendors, 30 drugs, batches with near-expiry and expired
+  stock, opening stock, and about 23 cases spread over every flow. It drives the cases through the
+  same services as the API, so their history and stock are real. It runs in stages and resumes if
+  the connection drops.
+- `demo-reset` creates a new demo hospital, moves the demo account to it and loads fresh demo
+  data. Nothing is deleted: ledger, audit and history are append-only, so the previous demo
+  hospital stays in the database, inactive for the account. Takes about a minute.
 
-| Method | Path       | Description                                                        |
-| ------ | ---------- | ------------------------------------------------------------------ |
-| GET    | `/`        | Health check. Returns a message and whether Supabase is initialised |
-| GET    | `/hello`   | Same response as `/`                                               |
-| GET    | `/test-db` | Reads one row from the Supabase `items` table to test the connection |
+Other operator commands: `hospital`, `member`, `grant` (see the top of
+[scripts/bootstrap.py](scripts/bootstrap.py)).
 
-FastAPI also serves interactive API docs:
+## Running
 
-- Swagger UI: http://localhost:8000/docs
-- ReDoc: http://localhost:8000/redoc
+```bash
+.venv/bin/uvicorn main:app --reload        # http://localhost:8000
+```
 
-## CORS
+Interactive API docs: http://localhost:8000/docs. The contract for the flow endpoints is
+[specs/002-flow-pages/contracts/openapi.yaml](../specs/002-flow-pages/contracts/openapi.yaml).
 
-The API currently accepts requests only from the Vite dev server at `http://localhost:5173`. To allow the deployed frontend, add its URL to `allow_origins` in [main.py](main.py).
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/v1/health` | API and database status |
+| `GET /api/v1/me` | The signed-in user's hospital, roles and permissions |
+| `GET/POST /api/v1/items`, `PATCH /api/v1/items/{id}` | Item master |
+| `GET /api/v1/flows` | The five flows as data (boxes and arrows) |
+| `GET/POST /api/v1/cases`, `GET /api/v1/cases/{id}` | Cases of a flow |
+| `POST /api/v1/cases/{id}/actions` | Take one arrow from the case's current box |
+| `POST /api/v1/expiry/scan` | Daily expiry scan |
+| `GET /api/v1/stock/balances`, `GET /api/v1/batches/{id}/trace` | Stock and recall trace |
+| `GET /api/v1/dashboard`, `/locations`, `/vendors`, `/batches` | Dashboard and masters |
 
-## Deployment
+Errors always look like `{"error": {"code", "message", "details", "request_id"}}`.
 
-Every push to `main` runs [.github/workflows/deploy.yml](.github/workflows/deploy.yml). You can also run it by hand from the Actions tab.
+## Code layout
 
-1. **Build:** builds the Docker image and pushes it to `ghcr.io/jeevanantham-poongodi/pms-backend`, tagged with `latest` and the commit SHA.
-2. **Deploy:** copies `docker-compose.prod.yml` to `~/PMS-backend` on the EC2 server, then pulls the new image and restarts the container.
+```
+app/
+├── api/v1/          routes and request/response schemas
+├── domain/          business rules: flows.py (case engine), effects.py (stock effects and
+│                    data-driven decisions), stock.py (posting, FEFO), expiry.py, overview.py
+├── flows/           definitions.py: the flow diagram as data
+├── repositories/    SQL
+├── core/            settings, sign-in, database, errors
+└── models.py        table definitions for Alembic
+scripts/             bootstrap.py (operator commands), demo_data.py
+alembic/             migrations
+tests/               pytest
+```
 
-### Required GitHub secrets
+## Tests
 
-| Secret        | Description                           |
-| ------------- | ------------------------------------- |
-| `EC2_HOST`    | Public IP or hostname of the server   |
-| `EC2_USER`    | SSH user (for example `ubuntu`)       |
-| `EC2_SSH_KEY` | Private SSH key for that user         |
+```bash
+.venv/bin/pytest            # ~115 tests; database tests use DATABASE_URL and roll back
+.venv/bin/ruff check . && .venv/bin/ruff format --check .
+```
 
-`GITHUB_TOKEN` is provided by GitHub automatically.
+Database tests create a throwaway hospital inside a transaction that is rolled back, so they
+leave no data behind. They take several minutes against the hosted database.
 
-### Server setup (one time)
+## Docker and deployment
 
-On the EC2 server:
-
-1. Install Docker and the Docker Compose plugin.
-2. Create the folder `~/PMS-backend`.
-3. Put a `.env` file with the production Supabase values in that folder.
-4. Open port `8000` in the instance's security group.
+`docker compose up --build` runs the API with `.env`. The GitHub workflow in
+[.github/workflows/deploy.yml](.github/workflows/deploy.yml) builds the image and deploys it to
+EC2; it predates the current configuration and must be given the variables above before use.
+Hosting is not decided yet (decisions D-002, D-003).

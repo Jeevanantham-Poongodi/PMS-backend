@@ -4,6 +4,8 @@ The hospital scope always comes from the user's own membership, never from the r
 (constitution, Tenant isolation). Privileged roles require MFA (aal2) (FR-008).
 """
 
+import threading
+import time
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
@@ -122,9 +124,37 @@ def load_user(claims: dict[str, Any]) -> CurrentUser:
     )
 
 
-def current_user(request: Request, settings: Settings = Depends(get_settings)) -> CurrentUser:
-    claims = verify_token(bearer_token(request), settings)
+# Membership, roles and permissions per access token, for a short time: loading them costs several
+# database round trips on every request. Keyed by the exact token, so a new sign-in, a refreshed
+# token or a different MFA level (the `aal` claim) always loads afresh.
+USER_CACHE_SECONDS = 60
+_user_cache: dict[str, tuple[float, CurrentUser]] = {}
+_user_cache_lock = threading.Lock()
+
+
+def clear_user_cache() -> None:
+    with _user_cache_lock:
+        _user_cache.clear()
+
+
+def cached_user(token: str, claims: dict[str, Any]) -> CurrentUser:
+    now = time.monotonic()
+    with _user_cache_lock:
+        hit = _user_cache.get(token)
+        if hit and hit[0] > now:
+            return hit[1]
     user = load_user(claims)
+    with _user_cache_lock:
+        for key in [k for k, (expires, _) in _user_cache.items() if expires <= now]:
+            del _user_cache[key]
+        _user_cache[token] = (now + USER_CACHE_SECONDS, user)
+    return user
+
+
+def current_user(request: Request, settings: Settings = Depends(get_settings)) -> CurrentUser:
+    token = bearer_token(request)
+    claims = verify_token(token, settings)
+    user = cached_user(token, claims)
     if user.privileged and not user.mfa_satisfied and not settings.demo_mode:
         raise AppError(
             403, "MFA_REQUIRED", "Your role requires multi-factor sign-in. Complete MFA and retry."
