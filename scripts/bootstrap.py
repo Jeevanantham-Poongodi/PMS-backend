@@ -8,9 +8,12 @@ person's sign-in account first in the Supabase dashboard (Authentication -> User
         --display-name "Admin" --role admin
     python scripts/bootstrap.py grant --hospital-id 1 --role pharmacist --permission items.read
     python scripts/bootstrap.py demo-user --email demo@pharmacy.local --password '...'
+    python scripts/bootstrap.py demo-data --email demo@pharmacy.local
 
 `demo-user` is for demo deployments: it creates the sign-in account itself (needs the service
 role key in SUPABASE_KEY), a hospital if none exists, and makes the account an administrator.
+`demo-data` loads fictional data for every flow into that account's hospital, acting as that
+account (app/demo_data.py); stages already loaded are skipped.
 
 Roles come from the actors in the flow diagram plus an administrator (FR-004). Only `admin` gets
 permissions automatically; every other role's permissions are configuration (OI-6).
@@ -25,7 +28,16 @@ import psycopg
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.core.auth import CurrentUser  # noqa: E402
 from app.core.config import Settings, get_settings  # noqa: E402
+from app.demo_data import Seeder, act_as  # noqa: E402
+
+# Settings every hospital starts with (constitution VIII): F4 alert windows and the D-012
+# temporary rule. Migration 0002 seeds them for hospitals that existed before it.
+DEFAULT_SETTINGS = {
+    "expiry.alert_windows_days": "[90, 60, 30]",
+    "allocation.block_on_expiry_date": "true",
+}
 
 ROLES = [
     ("store", "Store staff", False),
@@ -58,6 +70,12 @@ def create_hospital(conn: psycopg.Connection, name: str) -> int:
             " select %s, 'admin', code from public.permissions",
             (hospital_id,),
         )
+        for key, value in DEFAULT_SETTINGS.items():
+            conn.execute(
+                "insert into public.hospital_settings (hospital_id, key, value)"
+                " values (%s, %s, %s::jsonb)",
+                (hospital_id, key, value),
+            )
     print(f"hospital {hospital_id} created with {len(ROLES)} roles")
     return hospital_id
 
@@ -124,6 +142,43 @@ def demo_user(
     add_member(conn, hospital_id, email, display_name, "admin")
 
 
+def demo_data(conn: psycopg.Connection, email: str) -> None:
+    """Loads demo data into the account's hospital, acting as that account under RLS."""
+    row = conn.execute(
+        "select m.hospital_id, m.user_id::text, m.display_name from public.hospital_members m"
+        " join auth.users u on u.id = m.user_id"
+        " where lower(u.email) = lower(%s) and m.active",
+        (email,),
+    ).fetchall()
+    if len(row) != 1:
+        raise SystemExit(f"{email} must be an active member of exactly one hospital")
+    hospital_id, user_id, display_name = row[0]
+    permissions = frozenset(
+        r[0]
+        for r in conn.execute(
+            "select distinct rp.permission_code from public.user_roles ur"
+            " join public.role_permissions rp"
+            "   on rp.hospital_id = ur.hospital_id and rp.role_code = ur.role_code"
+            " where ur.hospital_id = %s and ur.user_id = %s::uuid",
+            (hospital_id, user_id),
+        )
+    )
+    user = CurrentUser(
+        user_id=user_id,
+        hospital_id=hospital_id,
+        display_name=display_name,
+        roles=frozenset({"admin"}),
+        permissions=permissions,
+        privileged=True,
+        mfa_satisfied=True,
+        claims={"sub": user_id, "role": "authenticated"},
+    )
+    with conn.transaction():
+        act_as(conn, user)
+        Seeder(conn, user).run()
+    print(f"demo data loaded into hospital {hospital_id}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -142,6 +197,8 @@ def main() -> int:
     p.add_argument("--email", required=True)
     p.add_argument("--password", required=True)
     p.add_argument("--display-name", default="Demo Admin")
+    p = sub.add_parser("demo-data")
+    p.add_argument("--email", default=None, help="defaults to DEMO_EMAIL")
     args = parser.parse_args()
 
     settings = get_settings()
@@ -155,6 +212,8 @@ def main() -> int:
             add_member(conn, args.hospital_id, args.email, args.display_name, args.role)
         elif args.cmd == "demo-user":
             demo_user(conn, settings, args.email, args.password, args.display_name)
+        elif args.cmd == "demo-data":
+            demo_data(conn, args.email or settings.demo_email)
         else:
             grant(conn, args.hospital_id, args.role, args.permission)
     return 0

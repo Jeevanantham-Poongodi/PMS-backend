@@ -6,7 +6,8 @@ triggers) go into the migration by hand with op.execute().
 """
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
@@ -14,13 +15,17 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     Column,
+    Date,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
     Identity,
     Index,
+    Numeric,
+    SmallInteger,
     Table,
     Text,
+    UniqueConstraint,
     func,
     text,
 )
@@ -171,3 +176,217 @@ class Item(Base):
 
 
 Index("items_hospital_name_key", Item.hospital_id, func.lower(Item.name), unique=True)
+
+
+# ---------------------------------------------------------------------------------------------
+# Feature 002 — Flow pages: masters, stock ledger and cases (specs/002-flow-pages/data-model.md)
+# ---------------------------------------------------------------------------------------------
+
+LOCATION_KINDS = (
+    "central_store",
+    "pharmacy",
+    "ward",
+    "ot",
+    "icu",
+    "quarantine_qc",
+    "quarantine_expiry",
+    "quarantine_recall",
+)
+DOC_TYPES = (
+    "opening",
+    "receipt",
+    "transfer",
+    "issue",
+    "dispense",
+    "return",
+    "return_to_vendor",
+    "write_off",
+)
+
+
+def _in(column: str, values: tuple[str, ...]) -> str:
+    return f"{column} in ({', '.join(repr(v) for v in values)})"
+
+
+class Location(Base):
+    __tablename__ = "locations"
+    __table_args__ = (
+        UniqueConstraint("hospital_id", "code", name="locations_hospital_code_key"),
+        CheckConstraint(_in("kind", LOCATION_KINDS), name="locations_kind_check"),
+        # Quarantine is a location that is never allocatable (constitution III).
+        CheckConstraint(
+            "not (kind like 'quarantine_%' and allocatable)", name="locations_quarantine_check"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    hospital_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("hospitals.id"))
+    code: Mapped[str] = mapped_column(Text)
+    name: Mapped[str] = mapped_column(Text)
+    kind: Mapped[str] = mapped_column(Text)
+    allocatable: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
+
+
+class Vendor(Base):
+    __tablename__ = "vendors"
+    __table_args__ = (UniqueConstraint("hospital_id", "name", name="vendors_hospital_name_key"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    hospital_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("hospitals.id"))
+    name: Mapped[str] = mapped_column(Text)
+    active: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
+
+
+class Batch(Base):
+    __tablename__ = "batches"
+    __table_args__ = (
+        UniqueConstraint("hospital_id", "item_id", "batch_no", name="batches_item_batch_key"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    hospital_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("hospitals.id"))
+    item_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("items.id"))
+    batch_no: Mapped[str] = mapped_column(Text)
+    expiry_date: Mapped[date] = mapped_column(Date)
+    vendor_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("vendors.id"))
+    # Set by F5:"Block and quarantine batches"; a blocked batch is never allocated.
+    blocked: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    # FEFO tie-break (D-005 step 2).
+    first_receipt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class HospitalSetting(Base):
+    __tablename__ = "hospital_settings"
+
+    hospital_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("hospitals.id"), primary_key=True
+    )
+    key: Mapped[str] = mapped_column(Text, primary_key=True)
+    value: Mapped[Any] = mapped_column(JSONB)
+
+
+class StockDocument(Base):
+    """Append-only (trigger)."""
+
+    __tablename__ = "stock_documents"
+    __table_args__ = (
+        CheckConstraint(_in("doc_type", DOC_TYPES), name="stock_documents_type_check"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    hospital_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("hospitals.id"))
+    doc_type: Mapped[str] = mapped_column(Text)
+    case_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("flow_cases.id"))
+    patient_ref: Mapped[str | None] = mapped_column(Text)
+    prescriber: Mapped[str | None] = mapped_column(Text)
+    note: Mapped[str | None] = mapped_column(Text)
+    posted_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), server_default=text("auth.uid()")
+    )
+    posted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class LedgerLine(Base):
+    """Append-only (trigger); each insert updates stock_balances through app.apply_ledger_line."""
+
+    __tablename__ = "ledger_lines"
+    __table_args__ = (
+        CheckConstraint("qty <> 0", name="ledger_lines_qty_check"),
+        Index("ledger_lines_batch_idx", "hospital_id", "batch_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    hospital_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("hospitals.id"))
+    document_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("stock_documents.id"))
+    item_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("items.id"))
+    batch_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("batches.id"))
+    location_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("locations.id"))
+    qty: Mapped[Decimal] = mapped_column(Numeric(12, 2))
+    posted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class StockBalance(Base):
+    """Written only by the ledger trigger; can never go negative (FR-012)."""
+
+    __tablename__ = "stock_balances"
+    __table_args__ = (CheckConstraint("qty >= 0", name="stock_balances_qty_check"),)
+
+    hospital_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("hospitals.id"), primary_key=True
+    )
+    batch_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("batches.id"), primary_key=True)
+    location_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("locations.id"), primary_key=True
+    )
+    item_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("items.id"))
+    qty: Mapped[Decimal] = mapped_column(Numeric(12, 2))
+
+
+class FlowCase(Base):
+    __tablename__ = "flow_cases"
+    __table_args__ = (
+        CheckConstraint("flow >= 1 and flow <= 5", name="flow_cases_flow_check"),
+        Index("flow_cases_hospital_flow_idx", "hospital_id", "flow", "closed"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    hospital_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("hospitals.id"))
+    flow: Mapped[int] = mapped_column(SmallInteger)
+    # A node key of the flow, validated against app.flows.definitions.
+    node: Mapped[str] = mapped_column(Text)
+    title: Mapped[str] = mapped_column(Text)
+    data: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=text("'{}'::jsonb"))
+    parent_case_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("flow_cases.id"))
+    closed: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    raised_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), server_default=text("auth.uid()")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class FlowCaseLine(Base):
+    __tablename__ = "flow_case_lines"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    hospital_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("hospitals.id"))
+    case_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("flow_cases.id"))
+    item_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("items.id"))
+    batch_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("batches.id"))
+    location_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("locations.id"))
+    qty_requested: Mapped[Decimal] = mapped_column(Numeric(12, 2))
+    qty_approved: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
+
+
+class FlowEvent(Base):
+    """Append-only (trigger): one move through the diagram (FR-003)."""
+
+    __tablename__ = "flow_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    hospital_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("hospitals.id"))
+    case_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("flow_cases.id"))
+    from_node: Mapped[str | None] = mapped_column(Text)
+    outcome: Mapped[str | None] = mapped_column(Text)
+    to_node: Mapped[str] = mapped_column(Text)
+    actor: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), server_default=text("auth.uid()"))
+    note: Mapped[str | None] = mapped_column(Text)
+    input: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class NdpsRegister(Base):
+    """Append-only (trigger). Two sign-offs; different users unless demo mode (D-018)."""
+
+    __tablename__ = "ndps_register"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    hospital_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("hospitals.id"))
+    case_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("flow_cases.id"))
+    item_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("items.id"))
+    batch_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("batches.id"))
+    qty: Mapped[Decimal] = mapped_column(Numeric(12, 2))
+    patient_ref: Mapped[str] = mapped_column(Text)
+    signoff_1: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    signoff_2: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

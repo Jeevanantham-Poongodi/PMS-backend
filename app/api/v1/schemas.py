@@ -1,7 +1,7 @@
-from datetime import datetime
-from typing import Annotated, Literal
+from datetime import date, datetime
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
 FormularyStatus = Literal["formulary", "non_formulary"]
@@ -51,3 +51,180 @@ class Me(BaseModel):
 class Health(BaseModel):
     status: Literal["ok", "degraded"]
     database: Literal["ok", "unreachable", "not_configured"]
+
+
+# Flow pages (feature 002, specs/002-flow-pages/contracts/openapi.yaml) ---------------------------
+
+
+class FlowNode(BaseModel):
+    key: str
+    label: str
+    kind: Literal["start", "task", "decision", "end"]
+
+
+class FlowEdge(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    from_: str = Field(alias="from")
+    to: str
+    outcome: str | None
+    approval: bool
+    reason: bool
+    inputs: list[str]
+
+
+class FlowDefinition(BaseModel):
+    flow: int
+    title: str
+    starts: list[str]
+    nodes: list[FlowNode]
+    edges: list[FlowEdge]
+
+
+class LineInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: int
+    qty: float = Field(gt=0)
+    batch_id: int | None = None
+    location_id: int | None = None
+
+
+class CaseCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    flow: int = Field(ge=1, le=5)
+    start: str
+    title: Text
+    data: dict[str, Any] = Field(default_factory=dict)
+    lines: list[LineInput] = Field(default_factory=list)
+
+
+class CaseSummary(BaseModel):
+    id: int
+    flow: int
+    node: str
+    node_label: str
+    title: str
+    closed: bool
+    parent_case_id: int | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class CaseLine(BaseModel):
+    id: int
+    item_id: int
+    item_name: str
+    batch_id: int | None
+    batch_no: str | None
+    expiry_date: date | None
+    location_id: int | None
+    location_name: str | None
+    qty_requested: float
+    qty_approved: float | None
+
+
+class CaseEvent(BaseModel):
+    id: int
+    from_node: str | None
+    outcome: str | None
+    to_node: str
+    actor_name: str
+    note: str | None
+    created_at: datetime
+
+
+class CaseDetail(CaseSummary):
+    data: dict[str, Any]
+    lines: list[CaseLine]
+    events: list[CaseEvent]
+    actions: list[FlowEdge]
+    child_case_ids: list[int]
+
+
+class ActionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    edge: str
+    note: Annotated[str, StringConstraints(max_length=1000)] | None = None
+    input: dict[str, Any] | None = None
+
+
+class ScanResult(BaseModel):
+    created: int
+    case_ids: list[int]
+
+
+class Location(BaseModel):
+    id: int
+    code: str
+    name: str
+    kind: str
+    allocatable: bool
+
+
+class Vendor(BaseModel):
+    id: int
+    name: str
+
+
+class Batch(BaseModel):
+    id: int
+    item_id: int
+    item_name: str
+    batch_no: str
+    expiry_date: date
+    vendor_id: int | None
+    blocked: bool
+
+
+class Balance(BaseModel):
+    location_id: int
+    location_name: str
+    location_kind: str
+    item_id: int
+    item_name: str
+    batch_id: int
+    batch_no: str
+    expiry_date: date
+    blocked: bool
+    qty: float
+
+
+class Dispensed(BaseModel):
+    patient_ref: str | None
+    prescriber: str | None
+    qty: float
+    posted_at: datetime
+
+
+class BatchTrace(BaseModel):
+    batch: Batch
+    holdings: list[Balance]
+    dispensed: list[Dispensed]
+
+
+class OpenCases(BaseModel):
+    flow: int
+    node: str
+    node_label: str
+    count: int
+
+
+class NearExpiry(BaseModel):
+    window_days: int
+    batches: int
+    qty: float
+
+
+class QuarantineTotal(BaseModel):
+    location_name: str
+    qty: float
+
+
+class Dashboard(BaseModel):
+    open_cases: list[OpenCases]
+    near_expiry: list[NearExpiry]
+    quarantine: list[QuarantineTotal]

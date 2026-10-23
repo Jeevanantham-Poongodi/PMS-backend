@@ -23,9 +23,12 @@ class Settings(BaseSettings):
 
     cors_origins: str = "http://localhost:5173"
 
-    # Demo deployments only: privileged roles may sign in without MFA (relaxes FR-008).
+    # Demo deployments only: privileged roles may sign in without MFA (relaxes FR-008), the raiser
+    # may approve their own case and one user may give both NDPS sign-offs (D-018).
     demo_mode: bool = False
-    
+    # The demo account used by scripts/bootstrap.py demo-data.
+    demo_email: str = "demo@pharmacy.local"
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

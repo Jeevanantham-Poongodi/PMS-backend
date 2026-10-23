@@ -5,6 +5,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.api.v1 import flows_routes, stock_routes
 from app.api.v1.routes import router
 from app.core import db
 from app.core.config import get_settings
@@ -56,6 +57,8 @@ def create_app() -> FastAPI:
         expose_headers=["X-Request-ID"],
     )
     app.include_router(router)
+    app.include_router(flows_routes.router)
+    app.include_router(stock_routes.router)
     return app
 
 
